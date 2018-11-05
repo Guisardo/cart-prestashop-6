@@ -65,12 +65,12 @@ class MercadoPago extends PaymentModule
     public static $countryOptions = array(
         'MLA' => array(
             'normal' => array(
-                'value' => 73328, 'label' => 'MercadoEnvios - OCA Estándar',
-                'description' => 'MercadoEnvios - OCA Estándar',
+                'value' => 73328, 'label' => 'MercadoEnvios - Estándar',
+                'description' => 'Después de la publicación, recibirá el producto en',
             ),
             'expresso' => array(
-                'value' => 73330, 'label' => 'MercadoEnvios - OCA Prioritario',
-                'description' => 'MercadoEnvios - OCA Prioritario',
+                'value' => 504245, 'label' => 'MercadoEnvios - Prioritario',
+                'description' => 'Después de la publicación, recibirá el producto en',
             ),
             'MP_SHIPPING_MIN_W' => 10,
             'MP_SHIPPING_MAX_W' => 70,
@@ -270,7 +270,17 @@ class MercadoPago extends PaymentModule
             $order_state->color = $value[0];
             $order_state->deleted = true;
             $order_state->unremovable = true;
-            $order_state->send_email = $value[3][1];
+            $order_state->invoice = $value[3][0];
+            if ($value[2] == 'started') {
+                $order_state->send_email = false;
+            } else {
+                $order_state->send_email = $value[3][1];
+            }
+            if ($value[2] == "started") {
+                $order_state->logable = 0;
+            } else {
+                $order_state->logable = $value[3][4];
+            }
             $order_state->unremovable = $value[3][2];
             $order_state->hidden = $value[3][3];
             $order_state->delivery = $value[3][5];
@@ -370,7 +380,9 @@ class MercadoPago extends PaymentModule
                 !$this->registerHook('displayFooter') ||
                 !$this->registerHook('displayRightColumnProduct') ||
                 !$this->registerHook('displayShoppingCartFooter') ||
-                !$this->createTables()
+                !$this->createTables() ||
+                !$this->registerHook('actionUpdateQuantity') ||
+                !$this->registerHook('actionObjectZoneAddAfter')
             ) {
                 return false;
             }
@@ -385,6 +397,44 @@ class MercadoPago extends PaymentModule
             );
         }
         return true;
+    }
+
+    public function hookActionObjectZoneAddAfter($params) {
+        $ml_carriers = array();
+        $ml_carriers[] = Configuration::get('MERCADOPAGO_CARRIER_ID_1');
+        $ml_carriers[] = Configuration::get('MERCADOPAGO_CARRIER_ID_2');
+        $ranges_price = RangePrice::getRanges($ml_carriers[0]);
+        $ranges_weight = RangeWeight::getRanges($ml_carriers[0]);
+
+        foreach ($ml_carriers as $ml_carrier) {
+            Db::getInstance()->autoExecute(
+                _DB_PREFIX_.'carrier_zone',
+                array('id_carrier' => (int) $ml_carrier,
+                    'id_zone' => (int) ($params['object']->id),
+                ),
+                'INSERT'
+            );
+            Db::getInstance()->autoExecuteWithNullValues(
+                _DB_PREFIX_.'delivery',
+                array('id_carrier' => (int) $ml_carrier,
+                    'id_range_price' => (int) ($ranges_price[0]["id_range_price"]),
+                    'id_range_weight' => null,
+                    'id_zone' => (int) ($params['object']->id),
+                    'price' => '0',
+                ),
+                'INSERT'
+            );
+            Db::getInstance()->autoExecuteWithNullValues(
+                _DB_PREFIX_.'delivery',
+                array('id_carrier' => (int) $ml_carrier,
+                    'id_range_price' => null,
+                    'id_range_weight' => (int) ($ranges_weight[0]["id_range_weight"]),
+                    'id_zone' => (int) ($params['object']->id),
+                    'price' => '0',
+                ),
+                'INSERT'
+            );
+        }
     }
 
     public function hookDisplayRightColumnProduct($params)
@@ -461,12 +511,15 @@ class MercadoPago extends PaymentModule
         }
     }
 
-    private function isMercadoEnvios($id_carrier)
+    public function isMercadoEnvios($id_carrier)
     {
         $list_shipping = (array) Tools::jsonDecode(
             Configuration::get('MERCADOPAGO_CARRIER'),
             true
         );
+        if ($id_carrier == 52 || $id_carrier == 46) {
+            $id_carrier = 54;
+        }
         $id_mercadoenvios_service_code = 0;
         if (isset($list_shipping['MP_CARRIER']) &&
             array_key_exists($id_carrier, $list_shipping['MP_CARRIER'])) {
@@ -486,6 +539,25 @@ class MercadoPago extends PaymentModule
 
         $result = (Db::getInstance(_PS_USE_SQL_SLAVE_)->executeS($select));
         return $result ? $result[0]['id_order_state'] : 0;
+    }
+
+    public function hookActionUpdateQuantity($params)
+    {
+        $pack_id = Db::getInstance()->Execute('SELECT ps_packcontent_updated('.$params['id_product'].')');
+
+
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_TIMEOUT, 1);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+        curl_setopt($ch, CURLOPT_URL, 'https://local.fotos.ropitas.com.ar/ml/list.async.php?stockChange='.$params['id_product']);
+        curl_exec($ch);
+        if (!is_null($pack_id)) {
+            curl_setopt($ch, CURLOPT_URL, 'https://local.fotos.ropitas.com.ar/ml/list.async.php?stockChange='.$pack_id);
+            curl_exec($ch);
+        }
+
+        curl_close($ch);
     }
 
     public function hookDisplayAdminOrder($params)
@@ -561,9 +633,9 @@ class MercadoPago extends PaymentModule
         if ($id_mercadoenvios_service_code > 0) {
             $order_payments = $order->getOrderPayments();
             foreach ($order_payments as $order_payment) {
-                $result = $this->mercadopago->getPayment($order_payment->transaction_id, "custom");
+                $result = $this->mercadopago->getPayment(trim(explode(' / ', $order_payment->transaction_id)[0]), "custom");
                 if ($result['status'] == '404') {
-                    $result = $this->mercadopago->getPayment($order_payment->transaction_id, "standard");
+                    $result = $this->mercadopago->getPayment(trim(explode(' / ', $order_payment->transaction_id)[0]), "standard");
                 }
                 if ($result['status'] == '200') {
                     $payment_info = $result['response'];
@@ -573,7 +645,7 @@ class MercadoPago extends PaymentModule
                         $return_tracking = $this->setTracking(
                             $order,
                             $result_merchant['response']['shipments'],
-                            false
+                            $order_carrier->tracking_number == ''
                         );
                         $tag_shipment = $this->mercadopago->getTagShipment($return_tracking['shipment_id']);
                         $tag_shipment_zebra = $this->mercadopago->getTagShipmentZebra($return_tracking['shipment_id']);
@@ -584,7 +656,23 @@ class MercadoPago extends PaymentModule
                 }
                 break;
             }
+            $order_carrier = new OrderCarrier($id_order_carrier);
+            $data['tracking_number'] = $order_carrier->tracking_number;
+            $data['tracking_link'] = $this->mercadopago->getTrackingLink($order_carrier->tracking_number);
         }
+        $this->context->smarty->assign($data);
+    }
+
+    public function getTrackingLink($tracking_code) {
+        $trackingLink = false;
+        if (is_numeric($tracking_code)) {
+            $trackingLink = 'http://tracking.ocasa.com/Tracking/index?airbillnumber='.$tracking_code.'&i=18';
+        } elseif (preg_match('/^cp/i', $tracking_code)) {
+            $trackingLink = 'https://www.correoargentino.com.ar/formularios/ondnc';
+        } elseif ($tracking_code) {
+            $trackingLink = 'https://www.correoargentino.com.ar/empresas/tyt/service.php?cliente=16276000&id='.$tracking_code;
+        }
+        return $trackingLink;
     }
 
     private function loadPoints()
@@ -677,9 +765,9 @@ class MercadoPago extends PaymentModule
             } else {
                 $order_payments = $order->getOrderPayments();
                 foreach ($order_payments as $order_payment) {
-                    $result = $this->mercadopago->getPayment($order_payment->transaction_id, "custom");
+                    $result = $this->mercadopago->getPayment(trim(explode(' / ', $order_payment->transaction_id)[0]), "custom");
                     if ($result['status'] == '404') {
-                        $result = $this->mercadopago->getPayment($order_payment->transaction_id, "standard");
+                        $result = $this->mercadopago->getPayment(trim(explode(' / ', $order_payment->transaction_id)[0]), "standard");
                     }
                     if ($result['status'] == 200) {
                         $payment_info = $result['response'];
@@ -724,9 +812,9 @@ class MercadoPago extends PaymentModule
         $settings = null;
         $order_payments = $order->getOrderPayments();
         foreach ($order_payments as $order_payment) {
-            $result = $this->mercadopago->getPayment($order_payment->transaction_id, "custom");
+            $result = $this->mercadopago->getPayment(trim(explode(' / ', $order_payment->transaction_id)[0]), "custom");
             if ($result['status'] == '404') {
-                $result = $this->mercadopago->getPayment($order_payment->transaction_id, "standard");
+                $result = $this->mercadopago->getPayment(trim(explode(' / ', $order_payment->transaction_id)[0]), "standard");
             }
             if ($result['status'] == 200) {
                 $payment_info = $result['response'];
@@ -747,99 +835,101 @@ class MercadoPago extends PaymentModule
         return $settings;
     }
 
-    private function setTracking($order, $shipments, $update)
+    public function setTracking($order, $shipments, $update)
     {
         $shipment_id = null;
-        foreach ($shipments as $shipment) {
-            if ($shipment['shipping_mode'] != 'me2') {
-                continue;
-            }
-            $shipment_id = $shipment['id'];
-            $response_shipment = $this->mercadopago->getTracking($shipment_id);
-            $response_shipment = $response_shipment['response'];
-            $tracking_number = $response_shipment['tracking_number'];
-
-            if ($response_shipment['tracking_number'] != 'pending') {
-                $status = '';
-                switch ($response_shipment['status']) {
-                    case 'ready_to_ship':
-                        $status = $this->l('Ready to ship');
-                        break;
-                    default:
-                        $status = $response_shipment['status'];
-                        break;
+        if ($shipments) {
+            foreach ($shipments as $shipment) {
+                if ($shipment['shipping_mode'] != 'me2') {
+                    continue;
                 }
+                $shipment_id = $shipment['id'];
+                $response_shipment = $this->mercadopago->getTracking($shipment_id);
+                $response_shipment = $response_shipment['response'];
+                $tracking_number = $response_shipment['tracking_number'];
 
-                switch ($response_shipment['substatus']) {
-                    case 'ready_to_print':
-                        $substatus_description = $this->l('Tag ready to print');
-                        break;
-                    case 'printed':
-                        $substatus_description = $this->l('Tag printed');
-                        break;
-                    case 'stale':
-                        $substatus_description = $this->l('Unsuccessful');
-                        break;
-                    case 'delayed':
-                        $substatus_description = $this->l('Sending the delayed path');
-                        break;
-                    case 'receiver_absent':
-                        $substatus_description = $this->l('Missing recipient for delivery');
-                        break;
-                    case 'returning_to_sender':
-                        $substatus_description = $this->l('In return to sender');
-                        break;
-                    case 'claimed_me':
-                        $substatus_description = $this->l('Buyer initiates complaint and requested a refund.');
-                        break;
-                    default:
-                        $substatus_description = $response_shipment['substatus'];
-                        break;
-                }
-                $estimated_delivery = new DateTime(
-                    $response_shipment['shipping_option']
-                    ['estimated_delivery_time']
-                    ['date']
-                );
-                $estimated_handling_limit = new DateTime(
-                    $response_shipment['shipping_option']
-                    ['estimated_handling_limit']
-                    ['date']
-                );
-                $estimated_delivery_final = new DateTime(
-                    $response_shipment['shipping_option']
-                    ['estimated_delivery_final']
-                    ['date']
-                );
-                $result = array(
-                    'shipment_id' => $shipment_id,
-                    'tracking_number' => $tracking_number,
-                    'name' => $response_shipment['shipping_option']['name'],
-                    'status' => $status,
-                    'substatus' => $response_shipment['substatus'],
-                    'substatus_description' => $substatus_description,
-                    'estimated_delivery' => $estimated_delivery->format('d/m/Y'),
-                    'estimated_handling_limit' => $estimated_handling_limit->format('d/m/Y'),
-                    'estimated_delivery_final' => $estimated_delivery_final->format('d/m/Y'),
-                    'this_path_ssl' => (Configuration::get('PS_SSL_ENABLED') ? 'https://' : 'http://') .
-                    htmlspecialchars($_SERVER['HTTP_HOST'], ENT_COMPAT, 'UTF-8') . __PS_BASE_URI__,
-                );
-                if ($update) {
+                if ($response_shipment['tracking_number'] != 'pending') {
+                    $status = '';
+                    switch ($response_shipment['status']) {
+                        case 'ready_to_ship':
+                            $status = $this->l('Ready to ship');
+                            break;
+                        default:
+                            $status = $response_shipment['status'];
+                            break;
+                    }
+
+                    switch ($response_shipment['substatus']) {
+                        case 'ready_to_print':
+                            $substatus_description = $this->l('Tag ready to print');
+                            break;
+                        case 'printed':
+                            $substatus_description = $this->l('Tag printed');
+                            break;
+                        case 'stale':
+                            $substatus_description = $this->l('Unsuccessful');
+                            break;
+                        case 'delayed':
+                            $substatus_description = $this->l('Sending the delayed path');
+                            break;
+                        case 'receiver_absent':
+                            $substatus_description = $this->l('Missing recipient for delivery');
+                            break;
+                        case 'returning_to_sender':
+                            $substatus_description = $this->l('In return to sender');
+                            break;
+                        case 'claimed_me':
+                            $substatus_description = $this->l('Buyer initiates complaint and requested a refund.');
+                            break;
+                        default:
+                            $substatus_description = $response_shipment['substatus'];
+                            break;
+                    }
+                    $estimated_delivery = new DateTime(
+                        $response_shipment['shipping_option']
+                        ['estimated_delivery_time']
+                        ['date']
+                    );
+                    $estimated_handling_limit = new DateTime(
+                        $response_shipment['shipping_option']
+                        ['estimated_handling_limit']
+                        ['date']
+                    );
+                    $estimated_delivery_final = new DateTime(
+                        $response_shipment['shipping_option']
+                        ['estimated_delivery_final']
+                        ['date']
+                    );
+                    $result = array(
+                        'shipment_id' => $shipment_id,
+                        'tracking_number' => $tracking_number,
+                        'name' => $response_shipment['shipping_option']['name'],
+                        'status' => $status,
+                        'substatus' => $response_shipment['substatus'],
+                        'substatus_description' => $substatus_description,
+                        'estimated_delivery' => $estimated_delivery->format('d/m/Y'),
+                        'estimated_handling_limit' => $estimated_handling_limit->format('d/m/Y'),
+                        'estimated_delivery_final' => $estimated_delivery_final->format('d/m/Y'),
+                        'this_path_ssl' => (Configuration::get('PS_SSL_ENABLED') ? 'https://' : 'http://') .
+                        htmlspecialchars($_SERVER['HTTP_HOST'], ENT_COMPAT, 'UTF-8') . __PS_BASE_URI__,
+                    );
+
                     $id_order_carrier = $order->getIdOrderCarrier();
                     $order_carrier = new OrderCarrier($id_order_carrier);
-                    $order_carrier->tracking_number = $tracking_number;
-                    $order_carrier->update();
+                    if ($update || $order_carrier->tracking_number != $tracking_number) {
+                        $order_carrier->tracking_number = $tracking_number;
+                        $order_carrier->update();
+                    }
+                } else {
+                    $result = array(
+                        'shipment_id' => $shipment_id,
+                        'tracking_number' => '',
+                        'this_path_ssl' => (Configuration::get('PS_SSL_ENABLED') ? 'https://' : 'http://') .
+                        htmlspecialchars($_SERVER['HTTP_HOST'], ENT_COMPAT, 'UTF-8') . __PS_BASE_URI__,
+                    );
                 }
-            } else {
-                $result = array(
-                    'shipment_id' => $shipment_id,
-                    'tracking_number' => '',
-                    'this_path_ssl' => (Configuration::get('PS_SSL_ENABLED') ? 'https://' : 'http://') .
-                    htmlspecialchars($_SERVER['HTTP_HOST'], ENT_COMPAT, 'UTF-8') . __PS_BASE_URI__,
-                );
             }
         }
-
         return $result;
     }
 
@@ -2477,6 +2567,12 @@ class MercadoPago extends PaymentModule
 
     public function getDimensions(&$products)
     {
+        return array(
+            'width' => 7, // > 0.01 ? $width : $this->config['default_width'], 0),
+            'height' => 28, // > 0.01 ? $height : $this->config['default_height'], 0),
+            'depth' => 21, // > 0.01 ? $depth : $this->config['default_depth'], 0),
+            'weight' => 1, // > 0.1 ? $weight : $this->config['default_weight'], 0),
+        );
         $width = 0;
         $height = 0;
         $depth = 0;
@@ -2781,7 +2877,9 @@ class MercadoPago extends PaymentModule
                     return;
                 }
             }
-            if ($payment_status == 'cancelled' || $payment_status == 'rejected') {
+            if ($payment_status == 'cancelled' || $payment_status == 'rejected' ||
+                $payment_status == 'shipped' || $payment_status == 'delivered' ||
+                $payment_status == 'refunded') {
                 if ($order->module == "mercadopago" || $checkout == 'pos') {
                     $retorno = $this->getOrderStateApproved($id_order);
                     if ($retorno) {
@@ -2791,9 +2889,84 @@ class MercadoPago extends PaymentModule
                     return;
                 }
             }
+
+            // Load tracking info when shipped
+            if ($payment_status == 'shipped') {
+                $order_payments = $order->getOrderPayments();
+                foreach ($order_payments as $order_payment) {
+                    $result = $this->mercadopago->getPayment(trim(explode(' / ', $order_payment->transaction_id)[0]), "custom");
+                    if ($result['status'] == '404') {
+                        $result = $this->mercadopago->getPayment(trim(explode(' / ', $order_payment->transaction_id)[0]), "standard");
+                    }
+                    if ($result['status'] == 200) {
+                        $payment_info = $result['response'];
+                        $id_mercadoenvios_service_code = $this->isMercadoEnvios($order->id_carrier);
+
+                        if ($id_mercadoenvios_service_code > 0) {
+                            $merchant_order_id = $payment_info['order']['id'];
+                            $result_merchant = $this->mercadopago->getMerchantOrder($merchant_order_id);
+                            $return_tracking = $this->setTracking(
+                                $order,
+                                $result_merchant['response']['shipments'],
+                                true
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+
             $statusPS = (int) $order->getCurrentState();
+            $shouldChangeStatus = false;
+            $ignoreOrders = array(
+                490,
+                643,
+                678,
+                694,
+                718,
+                731,
+                746,
+                781,
+                811,
+                980,
+                1025,
+                1030,
+                1033,
+                1083,
+                1089,
+                1110
+            );
+
+            if (!in_array($id_order, $ignoreOrders)) {
+                if ($statusPS == 6) {
+                    if ($payment_status === 'approved' || $payment_status === 'ready_to_ship') {
+                        // cancelled orders only can be changed by approved or ready_to_ship
+                        $shouldChangeStatus = true;
+                    }
+                } elseif ($statusPS == Configuration::get(UtilMercadoPago::$statusMercadoPagoPresta['shipped'])) {
+                    if ($payment_status === 'delivered') {
+                        // shipped only can be changed by delivered
+                        $shouldChangeStatus = true;
+                    }
+                } elseif ($statusPS == Configuration::get(UtilMercadoPago::$statusMercadoPagoPresta['ready_to_ship'])) {
+                    if ($payment_status === 'shipped') {
+                        // ready_to_ship only can be changed by shipped
+                        $shouldChangeStatus = true;
+                    }
+                } else {
+                    foreach (UtilMercadoPago::$statusMercadoPagoPresta as $key => $value) {
+                        if ($key !== 'shipped' && $key !== 'delivered') { //shipped and delivered should not be changed by lower statuses
+                            if ($statusPS == Configuration::get($value)) {
+                                $shouldChangeStatus = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             $payment_status = Configuration::get(UtilMercadoPago::$statusMercadoPagoPresta[$payment_status]);
-            if ($payment_status != $statusPS) {
+            if ($shouldChangeStatus && $statusPS != $payment_status) {
                 $order->setCurrentState($payment_status);
             }
             try {
@@ -3048,7 +3221,7 @@ class MercadoPago extends PaymentModule
                     'name' => $shipping_option['name'],
                     'checked' => $shipping_option['display'],
                     'shipping_speed' => $shipping_speed,
-                    'estimated_delivery' => $shipping_speed < 24 ? 1 : ceil($shipping_speed / 24),
+                    'estimated_delivery' => $shipping_speed < 24 ? 1 : ceil($shipping_speed / 24) + 2,
                     'cost' => $shipping_option['cost'] == 0 ? 'FREE' : $shipping_option['cost'],
                 );
             }
@@ -3183,6 +3356,7 @@ class MercadoPago extends PaymentModule
         $products = $cart->getProducts();
         $mp = $this->mercadopago;
 
+        /*
         // pega medidas dos produtos
         $width = 0;
         $height = 0;
@@ -3210,6 +3384,8 @@ class MercadoPago extends PaymentModule
         }
 
         $dimensions = $height . 'x' . $width . 'x' . $length . ',' . $weight;
+        */
+        $dimensions = '7x28x21,1';
 
         $postcode = UtilMercadoPago::getCodigoPostal($address->postcode);
 
@@ -3235,7 +3411,7 @@ class MercadoPago extends PaymentModule
                         'name' => $shipping_option['name'],
                         'checked' => $shipping_option['display'] == 'recommended' ? "checked='checked'" : '',
                         'shipping_speed' => $shipping_speed,
-                        'estimated_delivery' => $shipping_speed < 24 ? 1 : ceil($shipping_speed / 24),
+                        'estimated_delivery' => $shipping_speed < 24 ? 1 : ceil($shipping_speed / 24) + 2,
                         'cost' => $shipping_option['cost'] == 0 ? 'FREE' : $shipping_option['cost'],
                     );
                     break;
